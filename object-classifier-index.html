@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Object Border & Classifier</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      background: #161b22;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #30363d;
+    }
+    input, button, select {
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #30363d;
+      background: #21262d;
+      color: #e6edf3;
+      font-size: 14px;
+    }
+    button { cursor: pointer; }
+    button.primary { background: #238636; border-color: #2ea043; font-weight: 600; }
+    .stage {
+      position: relative;
+      width: 100%;
+      max-width: 800px;
+      aspect-ratio: 4 / 3;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #30363d;
+    }
+    video, canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .spoken {
+      font-size: 18px;
+      font-weight: 600;
+      color: #3fb950;
+      min-height: 24px;
+    }
+    .classes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .pill {
+      background: #161b22;
+      border: 1px solid #30363d;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .pill button { padding: 2px 6px; font-size: 11px; }
+    #status { font-size: 13px; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <button id="startBtn" class="primary">Start Camera</button>
+    <button id="bgBtn">Calibrate Background</button>
+    <select id="modeSelect">
+      <option value="bg">Background Subtraction</option>
+      <option value="motion">Motion Detection</option>
+    </select>
+    <input id="labelInput" type="text" placeholder="Object name (e.g. Water Bottle)" />
+    <button id="saveBtn" class="primary">Classify Selected</button>
+    <label style="font-size:13px; display:flex; align-items:center; gap:5px;">
+      <input id="speakToggle" type="checkbox" checked /> Speak words
+    </label>
+    <span id="status">Idle</span>
+  </div>
+
+  <div id="spokenReadout" class="spoken">Waiting for camera...</div>
+  <div id="classes" class="classes"></div>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const workCanvas = document.createElement("canvas");
+    const workCtx = workCanvas.getContext("2d", { willReadFrequently: true });
+
+    const statusEl = document.getElementById("status");
+    const spokenEl = document.getElementById("spokenReadout");
+    const labelInput = document.getElementById("labelInput");
+    const classesEl = document.getElementById("classes");
+    const modeSelect = document.getElementById("modeSelect");
+    const speakToggle = document.getElementById("speakToggle");
+
+    const W = 160;
+    const H = 120;
+    workCanvas.width = W;
+    workCanvas.height = H;
+
+    let running = false;
+    let bgFrame = null;
+    let prevFrame = null;
+    let blobs = [];
+    let selectedBlobIdx = 0;
+    let savedClasses = []; // { label, vector }
+    let lastSpoken = "";
+    let lastSpeakTime = 0;
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    function sayWords(text) {
+      spokenEl.textContent = text;
+      if (!speakToggle.checked || !("speechSynthesis" in window)) return;
+      const now = Date.now();
+      if (text !== lastSpoken || now - lastSpeakTime > 3000) {
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        window.speechSynthesis.speak(utter);
+        lastSpoken = text;
+        lastSpeakTime = now;
+      }
+    }
+
+    function grabFrame() {
+      workCtx.drawImage(video, 0, 0, W, H);
+      return workCtx.getImageData(0, 0, W, H).data;
+    }
+
+    function extractBlobs(curr) {
+      const mask = new Uint8Array(W * H);
+      for (let i = 0; i < W * H; i++) {
+        const idx = i * 4;
+        let diff = 0;
+        if (modeSelect.value === "bg" && bgFrame) {
+          diff = (
+            Math.abs(curr[idx] - bgFrame[idx]) +
+            Math.abs(curr[idx + 1] - bgFrame[idx + 1]) +
+            Math.abs(curr[idx + 2] - bgFrame[idx + 2])
+          ) / 3;
+        } else if (prevFrame) {
+          diff = (
+            Math.abs(curr[idx] - prevFrame[idx]) +
+            Math.abs(curr[idx + 1] - prevFrame[idx + 1]) +
+            Math.abs(curr[idx + 2] - prevFrame[idx + 2])
+          ) / 3;
+        }
+        if (diff > 28) mask[i] = 1;
+      }
+
+      const visited = new Uint8Array(W * H);
+      const found = [];
+
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const start = y * W + x;
+          if (!mask[start] || visited[start]) continue;
+
+          const queue = [start];
+          visited[start] = 1;
+          let minX = x, maxX = x, minY = y, maxY = y, area = 0;
+
+          while (queue.length) {
+            const p = queue.pop();
+            const px = p % W;
+            const py = (p - px) / W;
+            area++;
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+
+            const neighbors = [p - 1, p + 1, p - W, p + W];
+            for (const n of neighbors) {
+              if (n >= 0 && n < W * H && !visited[n] && mask[n]) {
+                visited[n] = 1;
+                queue.push(n);
+              }
+            }
+          }
+
+          if (area >= 60) {
+            found.push({
+              x: minX / W,
+              y: minY / H,
+              w: (maxX - minX + 1) / W,
+              h: (maxY - minY + 1) / H,
+              area
+            });
+          }
+        }
+      }
+
+      found.sort((a, b) => b.area - a.area);
+      return found.slice(0, 5);
+    }
+
+    function extractFeature(data, blob) {
+      const x0 = Math.max(0, Math.floor(blob.x * W));
+      const y0 = Math.max(0, Math.floor(blob.y * H));
+      const x1 = Math.min(W, Math.ceil((blob.x + blob.w) * W));
+      const y1 = Math.min(H, Math.ceil((blob.y + blob.h) * H));
+
+      const bins = new Float32Array(12); // 4 bins each for R, G, B
+      let count = 0;
+
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const idx = (y * W + x) * 4;
+          const rBin = Math.min(3, Math.floor(data[idx] / 64));
+          const gBin = Math.min(3, Math.floor(data[idx + 1] / 64));
+          const bBin = Math.min(3, Math.floor(data[idx + 2] / 64));
+          bins[rBin] += 1;
+          bins[4 + gBin] += 1;
+          bins[8 + bBin] += 1;
+          count++;
+        }
+      }
+
+      if (count > 0) {
+        for (let i = 0; i < bins.length; i++) bins[i] /= count;
+      }
+
+      const aspect = blob.w / Math.max(0.01, blob.h);
+      return [...bins, Math.min(2, aspect / 2)];
+    }
+
+    function cosineSim(a, b) {
+      let dot = 0, na = 0, nb = 0;
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+      }
+      return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+    }
+
+    function matchObject(vec) {
+      let best = null;
+      for (const item of savedClasses) {
+        const score = cosineSim(vec, item.vector);
+        if (!best || score > best.score) best = { label: item.label, score };
+      }
+      return best && best.score >= 0.88 ? best : null;
+    }
+
+    function renderClasses() {
+      classesEl.innerHTML = "";
+      savedClasses.forEach((c, idx) => {
+        const pill = document.createElement("div");
+        pill.className = "pill";
+        pill.innerHTML = `<span>${c.label}</span>`;
+        const del = document.createElement("button");
+        del.textContent = "x";
+        del.onclick = () => {
+          savedClasses.splice(idx, 1);
+          renderClasses();
+        };
+        pill.appendChild(del);
+        classesEl.appendChild(pill);
+      });
+    }
+
+    document.getElementById("startBtn").onclick = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 800, height: 600, facingMode: "environment" },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      canvas.width = video.videoWidth || 800;
+      canvas.height = video.videoHeight || 600;
+      bgFrame = grabFrame();
+      prevFrame = new Uint8ClampedArray(bgFrame);
+      running = true;
+      setStatus("Camera active — step out briefly and click Calibrate Background for best results.");
+      requestAnimationFrame(loop);
+    };
+
+    document.getElementById("bgBtn").onclick = () => {
+      if (video.readyState >= 2) {
+        bgFrame = grabFrame();
+        setStatus("Background calibrated.");
+      }
+    };
+
+    canvas.onclick = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const nx = (e.clientX - rect.left) / rect.width;
+      const ny = (e.clientY - rect.top) / rect.height;
+      const idx = blobs.findIndex(b => nx >= b.x && nx <= b.x + b.w && ny >= b.y && ny <= b.y + b.h);
+      if (idx !== -1) {
+        selectedBlobIdx = idx;
+        setStatus(`Selected box #${idx + 1}. Type a name and click Classify Selected.`);
+      }
+    };
+
+    document.getElementById("saveBtn").onclick = () => {
+      const label = labelInput.value.trim();
+      if (!label) return setStatus("Type an object name first.");
+      const target = blobs[selectedBlobIdx] || blobs[0];
+      if (!target) return setStatus("No object border detected yet.");
+      const curr = grabFrame();
+      savedClasses.push({ label, vector: extractFeature(curr, target) });
+      renderClasses();
+      setStatus(`Saved "${label}".`);
+      sayWords(`Saved ${label}`);
+    };
+
+    function loop() {
+      if (!running) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (video.readyState >= 2) {
+        const curr = grabFrame();
+        blobs = extractBlobs(curr);
+        if (selectedBlobIdx >= blobs.length) selectedBlobIdx = 0;
+
+        const recognizedNames = [];
+
+        blobs.forEach((b, idx) => {
+          const vec = extractFeature(curr, b);
+          const match = matchObject(vec);
+          const isSelected = idx === selectedBlobIdx;
+          const text = match ? match.label : (isSelected ? "Selected Object" : "Unlabeled Object");
+          const color = match ? "#3fb950" : (isSelected ? "#f0883e" : "#58a6ff");
+
+          if (match) recognizedNames.push(match.label);
+
+          const rx = b.x * canvas.width;
+          const ry = b.y * canvas.height;
+          const rw = b.w * canvas.width;
+          const rh = b.h * canvas.height;
+
+          ctx.strokeStyle = color;
+          ctx.lineWidth = isSelected ? 3.5 : 2;
+          ctx.strokeRect(rx, ry, rw, rh);
+
+          ctx.fillStyle = color;
+          ctx.fillRect(rx, Math.max(0, ry - 24), ctx.measureText(text).width + 14, 22);
+          ctx.fillStyle = "#0d1117";
+          ctx.font = "bold 13px system-ui, sans-serif";
+          ctx.fillText(text, rx + 7, Math.max(15, ry - 8));
+        });
+
+        if (recognizedNames.length > 0) {
+          sayWords(recognizedNames.join(", "));
+        } else if (blobs.length > 0) {
+          spokenEl.textContent = "Object detected — not yet classified";
+        } else {
+          spokenEl.textContent = "No object in view";
+        }
+
+        prevFrame = new Uint8ClampedArray(curr);
+      }
+
+      requestAnimationFrame(loop);
+    }
+  </script>
+</body>
+</html>
