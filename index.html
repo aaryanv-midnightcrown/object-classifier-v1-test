@@ -89,6 +89,7 @@
     </select>
     <input id="labelInput" type="text" placeholder="Object name (e.g. Water Bottle)" />
     <button id="saveBtn" class="primary">Classify Selected</button>
+    <button id="clearBtn">Clear Classes</button>
     <label style="font-size:13px; display:flex; align-items:center; gap:5px;">
       <input id="speakToggle" type="checkbox" checked /> Speak words
     </label>
@@ -151,6 +152,13 @@
       return workCtx.getImageData(0, 0, W, H).data;
     }
 
+    function grayAt(data, x, y) {
+      const clampedX = Math.max(0, Math.min(W - 1, x));
+      const clampedY = Math.max(0, Math.min(H - 1, y));
+      const idx = (clampedY * W + clampedX) * 4;
+      return 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+    }
+
     function extractBlobs(curr) {
       const mask = new Uint8Array(W * H);
       for (let i = 0; i < W * H; i++) {
@@ -169,7 +177,7 @@
             Math.abs(curr[idx + 2] - prevFrame[idx + 2])
           ) / 3;
         }
-        if (diff > 28) mask[i] = 1;
+        if (diff > 34) mask[i] = 1;
       }
 
       const visited = new Uint8Array(W * H);
@@ -203,13 +211,16 @@
             }
           }
 
-          if (area >= 60) {
+          const boxW = maxX - minX + 1;
+          const boxH = maxY - minY + 1;
+          if (area >= 90 && boxW >= 8 && boxH >= 8) {
             found.push({
               x: minX / W,
               y: minY / H,
-              w: (maxX - minX + 1) / W,
-              h: (maxY - minY + 1) / H,
-              area
+              w: boxW / W,
+              h: boxH / H,
+              area,
+              fillRatio: area / (boxW * boxH)
             });
           }
         }
@@ -219,44 +230,71 @@
       return found.slice(0, 5);
     }
 
+    function l2Normalize(vec) {
+      let sumSq = 0;
+      for (const v of vec) sumSq += v * v;
+      const norm = Math.sqrt(sumSq) || 1;
+      return vec.map(v => v / norm);
+    }
+
+    // Chromaticity + brightness histogram + edge density + shape ratios
     function extractFeature(data, blob) {
       const x0 = Math.max(0, Math.floor(blob.x * W));
       const y0 = Math.max(0, Math.floor(blob.y * H));
       const x1 = Math.min(W, Math.ceil((blob.x + blob.w) * W));
       const y1 = Math.min(H, Math.ceil((blob.y + blob.h) * H));
 
-      const bins = new Float32Array(12); // 4 bins each for R, G, B
+      const rgBins = new Float32Array(9); // 3x3 normalized r,g chromaticity
+      const valBins = new Float32Array(4); // brightness quartiles
       let count = 0;
+      let edgeSum = 0;
+      let edgeCount = 0;
 
       for (let y = y0; y < y1; y++) {
         for (let x = x0; x < x1; x++) {
           const idx = (y * W + x) * 4;
-          const rBin = Math.min(3, Math.floor(data[idx] / 64));
-          const gBin = Math.min(3, Math.floor(data[idx + 1] / 64));
-          const bBin = Math.min(3, Math.floor(data[idx + 2] / 64));
-          bins[rBin] += 1;
-          bins[4 + gBin] += 1;
-          bins[8 + bBin] += 1;
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
+          const sum = r + g + b + 1;
+
+          const rn = r / sum;
+          const gn = g / sum;
+          const rBin = Math.min(2, Math.floor(rn * 3));
+          const gBin = Math.min(2, Math.floor(gn * 3));
+          rgBins[rBin * 3 + gBin] += 1;
+
+          const val = Math.max(r, g, b) / 255;
+          const vBin = Math.min(3, Math.floor(val * 4));
+          valBins[vBin] += 1;
           count++;
+
+          if (x > x0 && x < x1 - 1 && y > y0 && y < y1 - 1) {
+            const gx = grayAt(data, x + 1, y) - grayAt(data, x - 1, y);
+            const gy = grayAt(data, x, y + 1) - grayAt(data, x, y - 1);
+            const mag = Math.hypot(gx, gy) / 255;
+            edgeSum += mag;
+            edgeCount++;
+          }
         }
       }
 
       if (count > 0) {
-        for (let i = 0; i < bins.length; i++) bins[i] /= count;
+        for (let i = 0; i < rgBins.length; i++) rgBins[i] /= count;
+        for (let i = 0; i < valBins.length; i++) valBins[i] /= count;
       }
 
-      const aspect = blob.w / Math.max(0.01, blob.h);
-      return [...bins, Math.min(2, aspect / 2)];
+      const edgeDensity = edgeCount > 0 ? Math.min(1, edgeSum / edgeCount) : 0;
+      const aspect = Math.min(2, (blob.w / Math.max(0.01, blob.h)) / 2);
+      const fill = Math.min(1, blob.fillRatio || 0.5);
+
+      return l2Normalize([...rgBins, ...valBins, edgeDensity, aspect, fill]);
     }
 
     function cosineSim(a, b) {
-      let dot = 0, na = 0, nb = 0;
-      for (let i = 0; i < a.length; i++) {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-      }
-      return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+      let dot = 0;
+      for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+      return dot;
     }
 
     function matchObject(vec) {
@@ -265,7 +303,7 @@
         const score = cosineSim(vec, item.vector);
         if (!best || score > best.score) best = { label: item.label, score };
       }
-      return best && best.score >= 0.88 ? best : null;
+      return best && best.score >= 0.94 ? best : null;
     }
 
     function renderClasses() {
@@ -285,6 +323,12 @@
       });
     }
 
+    document.getElementById("clearBtn").onclick = () => {
+      savedClasses = [];
+      renderClasses();
+      setStatus("Cleared all saved classes.");
+    };
+
     document.getElementById("startBtn").onclick = async () => {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 800, height: 600, facingMode: "environment" },
@@ -297,7 +341,7 @@
       bgFrame = grabFrame();
       prevFrame = new Uint8ClampedArray(bgFrame);
       running = true;
-      setStatus("Camera active — step out briefly and click Calibrate Background for best results.");
+      setStatus("Camera active — clear view and click Calibrate Background.");
       requestAnimationFrame(loop);
     };
 
@@ -346,7 +390,9 @@
           const vec = extractFeature(curr, b);
           const match = matchObject(vec);
           const isSelected = idx === selectedBlobIdx;
-          const text = match ? match.label : (isSelected ? "Selected Object" : "Unlabeled Object");
+          const text = match
+            ? `${match.label} (${Math.round(match.score * 100)}%)`
+            : (isSelected ? "Selected Object" : "Unlabeled Object");
           const color = match ? "#3fb950" : (isSelected ? "#f0883e" : "#58a6ff");
 
           if (match) recognizedNames.push(match.label);
